@@ -1,0 +1,28 @@
+# Reproducible build of the obfuscation-enabled netclient agent.
+# Build context must be the parent directory that holds the three sibling repos
+# (netclient, netmaker, amneziawg-go), because netclient's go.mod resolves them
+# via local replace directives:
+#   docker build -f netclient/Dockerfile.obfs -t netclient-obfs .
+FROM golang:1.25-alpine AS builder
+RUN apk add --no-cache git
+WORKDIR /src
+COPY amneziawg-go ./amneziawg-go
+COPY netmaker ./netmaker
+COPY netclient ./netclient
+WORKDIR /src/netclient
+# CGO disabled: fully static binary, runs on any libc. The ldflag overrides the
+# amneziawg-go UAPI socket dir to the standard /var/run/wireguard so wgctrl and
+# wg-tools find the userspace device.
+RUN GOOS=linux CGO_ENABLED=0 go build \
+    -ldflags="-w -s -X github.com/amnezia-vpn/amneziawg-go/ipc.socketDirectory=/var/run/wireguard" \
+    -o netclient .
+
+FROM alpine:3.23.4
+WORKDIR /root/
+# conntrack-tools + tcpdump included for the multi-NAT test rig (cone/symmetric
+# gateway control); harmless in normal use.
+RUN apk add --no-cache --update bash iproute2 iptables wireguard-tools conntrack-tools
+COPY --from=builder /src/netclient/netclient /root/netclient
+COPY netclient/scripts/netclient.sh /root/netclient.sh
+RUN chmod 0755 /root/netclient /root/netclient.sh
+ENTRYPOINT ["/bin/bash", "/root/netclient.sh"]

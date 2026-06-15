@@ -52,32 +52,45 @@ func StartConnectivityManager(ctx context.Context, wg *sync.WaitGroup) {
 				continue
 			}
 
-			// Roaming: re-probe direct on a public-endpoint change. A stable relayed
-			// connection is not torn down to re-test direct (that drops connectivity
-			// for the grace period); recovery happens when the host lands on a new
-			// network, which is the roaming case.
+			// Roaming: on a public-endpoint change just give the background probe a
+			// fresh grace window before any new relay decision. The relay is NOT
+			// torn down here — while relayed, the server keeps a warm background
+			// probe session to each peer (real endpoint + keepalive, no allowed
+			// IPs), so a direct path is re-detected in the background and the
+			// switch happens seamlessly, without dropping connectivity.
 			ep := ""
 			if config.HostPublicIP != nil {
 				ep = config.HostPublicIP.String()
 			}
 			if ep != lastEndpoint {
 				lastEndpoint = ep
-				if relayed {
-					slog.Info("connectivity: endpoint changed, re-probing direct", "endpoint", ep)
-				}
-				relayed = false
+				slog.Info("connectivity: public endpoint changed, re-evaluating direct", "endpoint", ep)
 				directDeadline = time.Now().Add(directGracePeriod)
 			}
 
+			// Continuous evaluation. A fresh handshake with any non-relay peer means
+			// a direct path exists right now — including the background probe session
+			// maintained while relayed. Because both the relay session and the direct
+			// probe are kept warm, flipping the verdict (which the server's auto-relay
+			// reconciler turns into an un-relay / re-relay) moves the routing onto an
+			// already-established session with no handshake gap.
 			verdict := nmmodels.NAT_Types.BehindNAT
-			if relayed {
+			switch {
+			case hasDirectConnectivity(server.AutoRelayPubKey):
+				if relayed {
+					slog.Info("connectivity: direct path proven live in background, un-relaying")
+				}
+				relayed = false
+				verdict = nmmodels.NAT_Types.BehindNAT
+				directDeadline = time.Now().Add(directGracePeriod)
+			case relayed:
 				verdict = nmmodels.NAT_Types.Symmetric
-			} else if hasDirectConnectivity(server.AutoRelayPubKey) {
-				// Direct works; nothing to do.
-			} else if time.Now().After(directDeadline) {
+			case time.Now().After(directDeadline):
 				relayed = true
 				verdict = nmmodels.NAT_Types.Symmetric
-				slog.Info("connectivity: no direct path to peers, requesting relay")
+				slog.Info("connectivity: no direct path to peers within grace, requesting relay")
+			default:
+				verdict = nmmodels.NAT_Types.BehindNAT
 			}
 
 			if verdict != config.HostNatType {
@@ -94,17 +107,20 @@ func StartConnectivityManager(ctx context.Context, wg *sync.WaitGroup) {
 // hasDirectConnectivity reports whether the host has a fresh WireGuard handshake
 // with at least one of its expected peers, excluding the auto-relay node (which
 // is public and always reachable, so a handshake with it must not mask isolation
-// from the actual peers). Returns true when there are no non-relay peers, or when
-// peer state can't be read, to avoid relaying spuriously.
+// from the actual peers). It returns true ONLY on positive proof (a fresh
+// handshake). All "no information" cases (no peers, unreadable device state)
+// return false: without proof we must not claim a direct path, otherwise a
+// transient empty/unreadable state would un-relay a correctly-relayed node and
+// cause relay<->direct flapping.
 func hasDirectConnectivity(relayPubKey string) bool {
 	nc := config.Netclient()
 	peers := nc.HostPeers
 	if len(peers) == 0 {
-		return true
+		return false
 	}
 	devicePeers, err := wireguard.GetPeersFromDevice(ncutils.GetInterfaceName())
 	if err != nil {
-		return true
+		return false
 	}
 	nonRelayPeers := 0
 	for i := range peers {
@@ -125,5 +141,11 @@ func hasDirectConnectivity(relayPubKey string) bool {
 			return true
 		}
 	}
-	return nonRelayPeers == 0
+	// No fresh handshake with any non-relay peer. Direct connectivity is NOT
+	// proven — return false even when there are currently no non-relay peers
+	// (e.g. a transient peer-update where the relayed peer is briefly absent).
+	// Treating "no peers to check" as "direct works" caused relay<->direct
+	// flapping: a momentary empty set un-relayed a correctly-relayed node.
+	_ = nonRelayPeers
+	return false
 }

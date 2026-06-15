@@ -364,6 +364,14 @@ func HostPeerUpdate(client mqtt.Client, msg mqtt.Message) {
 		server.IsPro = true
 		saveServerConfig = true
 	}
+	// Propagate the designated auto-relay node's public key so the connectivity
+	// manager can exclude the (always-reachable) relay session when deciding
+	// whether a real direct path to peers exists. The pull path already carries
+	// this via UpdateServerConfig; MQ peer updates set fields individually.
+	if peerUpdate.AutoRelayPubKey != server.AutoRelayPubKey {
+		server.AutoRelayPubKey = peerUpdate.AutoRelayPubKey
+		saveServerConfig = true
+	}
 
 	if saveServerConfig {
 		config.UpdateServer(serverName, *server)
