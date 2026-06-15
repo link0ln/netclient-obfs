@@ -225,7 +225,7 @@ func startGoRoutines(wg *sync.WaitGroup) context.CancelFunc {
 				slog.Info("seeded HostPublicIP from stored endpoint", "ip", netclientCfg.EndpointIP)
 			}
 		}
-		if netclientCfg.NatType == "" {
+		if config.HostNatType != "" && netclientCfg.NatType != config.HostNatType {
 			netclientCfg.NatType = config.HostNatType
 			updateConfig = true
 		}
@@ -332,6 +332,10 @@ func startGoRoutines(wg *sync.WaitGroup) context.CancelFunc {
 		wg.Add(1)
 		go networking.CheckPeerEndpoints(ctx, wg)
 	}
+	// Liveness-based adaptive relay fallback: try direct, relay if isolated, re-probe
+	// direct on roaming/periodically. Community alternative to the pro auto-relay.
+	wg.Add(1)
+	go StartConnectivityManager(ctx, wg)
 	wg.Add(1)
 	go mqFallback(ctx, wg)
 	StartEgressDomainMonitor(ctx, wg)

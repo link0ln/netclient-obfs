@@ -99,6 +99,14 @@ func UpdatePeer(p *wgtypes.PeerConfig) error {
 
 func apply(c *wgtypes.Config) error {
 	slog.Debug("applying wireguard config")
+	// On platforms where the userspace AmneziaWG device cannot be reached via
+	// wgctrl (Windows: wgctrl's kernel client intercepts the adapter and returns
+	// "Access is denied" before the userspace named-pipe client is tried), configure
+	// the device we own directly via its UAPI. applyUserspace returns handled=false
+	// on the wgctrl-friendly paths (unix, or the Windows kernel-driver path).
+	if handled, err := applyUserspace(c); handled {
+		return err
+	}
 	wg, err := wgctrl.New()
 	if err != nil {
 		return fmt.Errorf("wgctrl %w", err)
@@ -142,6 +150,12 @@ func EndpointDetectedAlready(peerPubKey string) bool {
 }
 
 func GetPeersFromDevice(ifaceName string) (map[string]wgtypes.Peer, error) {
+	// On the Windows userspace path, wgctrl cannot read the device (its kernel
+	// client intercepts the adapter and returns "Access is denied"), so read the
+	// peer handshakes directly from the device we own.
+	if peers, ok := userspacePeers(ifaceName); ok {
+		return peers, nil
+	}
 	peerMap := make(map[string]wgtypes.Peer)
 	wg, err := wgctrl.New()
 	if err != nil {

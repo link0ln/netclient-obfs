@@ -3,6 +3,7 @@ module github.com/gravitl/netclient
 go 1.25.3
 
 require (
+	github.com/amnezia-vpn/amneziawg-go v0.0.0-00010101000000-000000000000
 	github.com/blang/semver v3.5.1+incompatible
 	github.com/coreos/go-iptables v0.8.0
 	github.com/eclipse/paho.mqtt.golang v1.5.1
@@ -27,12 +28,11 @@ require (
 	github.com/ti-mo/netfilter v0.5.3
 	github.com/vishvananda/netlink v1.3.1
 	golang.org/x/crypto v0.52.0
-	golang.org/x/exp v0.0.0-20230905200255-921286631fa9
+	golang.org/x/exp v0.0.0-20240506185415-9bf2ced13842
 	golang.org/x/net v0.54.0
 	golang.org/x/sys v0.45.0
 	golang.org/x/term v0.43.0
 	golang.org/x/text v0.37.0
-	golang.zx2c4.com/wireguard v0.0.0-20220920152132-bb719d3a6e2c
 	golang.zx2c4.com/wireguard/wgctrl v0.0.0-20221104135756-97bc4ad4a1cb
 	golang.zx2c4.com/wireguard/windows v1.0.1
 	gopkg.in/yaml.v3 v3.0.1
@@ -79,8 +79,6 @@ require (
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/rqlite/gorqlite v0.0.0-20240122221808-a8a425b1a6aa // indirect
 	github.com/sagikazarmark/locafero v0.11.0 // indirect
-	github.com/seancfoley/bintree v1.3.1 // indirect
-	github.com/seancfoley/ipaddress-go v1.7.1 // indirect
 	github.com/sourcegraph/conc v0.3.1-0.20240121214520-5f936abd7ae8 // indirect
 	github.com/spf13/afero v1.15.0 // indirect
 	github.com/spf13/cast v1.10.0 // indirect
@@ -91,7 +89,8 @@ require (
 	golang.org/x/mod v0.35.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/tools v0.44.0 // indirect
-	golang.zx2c4.com/wintun v0.0.0-20211104114900-415007cec224 // indirect
+	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
+	golang.zx2c4.com/wireguard v0.0.0-20220920152132-bb719d3a6e2c // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260311181403-84a4fc48630c // indirect
 	google.golang.org/grpc v1.81.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
@@ -101,3 +100,7 @@ require (
 	gorm.io/driver/sqlite v1.6.0 // indirect
 	gorm.io/gorm v1.31.1 // indirect
 )
+
+replace github.com/gravitl/netmaker => ../netmaker
+
+replace github.com/amnezia-vpn/amneziawg-go => ../amneziawg-go

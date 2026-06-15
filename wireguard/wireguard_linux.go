@@ -24,7 +24,10 @@ const (
 
 // NCIface.Create - creates a linux WG interface based on a node's host config
 func (nc *NCIface) Create() error {
-	if isKernelWireGuardPresent() {
+	// When AmneziaWG obfuscation is enabled we must use the userspace amneziawg-go
+	// dataplane (the kernel WireGuard path cannot apply jc/s/h obfuscation), so
+	// force userspace even when the host kernel has WireGuard available.
+	if !amneziaWGEnabled() && isKernelWireGuardPresent() {
 		newLink := nc.getKernelLink()
 		if newLink == nil {
 			return fmt.Errorf("failed to create kernel interface")
@@ -93,7 +96,10 @@ func (l *netLink) Type() string {
 
 // NCIface.Close closes netmaker interface
 func (n *NCIface) Close() {
-	if isKernelWireGuardPresent() {
+	// Must mirror Create(): when AmneziaWG forces userspace, Close() has to take the
+	// userspace branch too, otherwise it leaves the UAPI goroutine running and the
+	// next createUserSpaceWG races the global uapi/tunDevice -> nil deref panic.
+	if !amneziaWGEnabled() && isKernelWireGuardPresent() {
 		link := n.getKernelLink()
 		link.Close()
 	} else if isTunModuleLoaded() {

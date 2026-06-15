@@ -105,14 +105,13 @@ func (n *NCIface) Configure() error {
 	defer wgMutex.Unlock()
 	logger.Log(0, "adding addresses to netmaker interface")
 	if err := n.ApplyAddrs(); err != nil {
-		return err
+		return fmt.Errorf("ApplyAddrs: %w", err)
 	}
 	if err := n.SetMTU(); err != nil {
 		return fmt.Errorf("Configure set MTU %w", err)
 	}
-	err := apply(&n.Config)
-	if err != nil {
-		return err
+	if err := apply(&n.Config); err != nil {
+		return fmt.Errorf("apply(wgctrl): %w", err)
 	}
 	return nil
 }

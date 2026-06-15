@@ -1,0 +1,7 @@
+FROM alpine:3.23.3
+WORKDIR /root/
+RUN apk add --no-cache --update bash iproute2 iptables wireguard-tools
+COPY netclient-app /root/netclient
+COPY scripts/netclient.sh /root/netclient.sh
+RUN chmod 0755 /root/netclient /root/netclient.sh
+ENTRYPOINT ["/bin/bash", "/root/netclient.sh"]

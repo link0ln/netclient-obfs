@@ -1,6 +1,7 @@
 package wireguard
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,14 +11,22 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	awgconn "github.com/amnezia-vpn/amneziawg-go/conn"
+	awgdevice "github.com/amnezia-vpn/amneziawg-go/device"
+	awgipc "github.com/amnezia-vpn/amneziawg-go/ipc"
+	awgtun "github.com/amnezia-vpn/amneziawg-go/tun"
 	"github.com/google/uuid"
 	"github.com/gravitl/netclient/config"
 	"github.com/gravitl/netclient/ncutils"
 	"github.com/gravitl/netmaker/logger"
 	"golang.org/x/exp/slog"
 	"golang.org/x/sys/windows"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	"golang.zx2c4.com/wireguard/windows/driver"
+	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
 // TODO: update from netsh to a more programmatic approach.
@@ -26,6 +35,14 @@ import (
 func (nc *NCIface) Create() error {
 	wgMutex.Lock()
 	defer wgMutex.Unlock()
+
+	// When AmneziaWG obfuscation is enabled we must use the userspace amneziawg-go
+	// dataplane (the wireguard-nt kernel driver cannot apply jc/s/h obfuscation),
+	// so force userspace over Wintun even though Windows normally uses the driver.
+	if amneziaWGEnabled() {
+		slog.Info("AmneziaWG enabled: using userspace amneziawg-go dataplane (windows)")
+		return nc.createUserSpaceWGWindows()
+	}
 
 	var ifaceMetric uint32
 	if !nc.IsTestIface {
@@ -103,7 +120,213 @@ func (nc *NCIface) ApplyAddrs() error {
 		}
 	}
 
-	return adapter.(*driver.Adapter).LUID().SetIPAddresses(prefixAddrs)
+	switch a := adapter.(type) {
+	case *driver.Adapter:
+		return a.LUID().SetIPAddresses(prefixAddrs)
+	case *userspaceWGWin:
+		luid := a.luid()
+		slog.Info("setting addresses on userspace adapter", "luid", uint64(luid), "addrs", fmt.Sprintf("%v", prefixAddrs))
+		if err := luid.SetIPAddresses(prefixAddrs); err != nil {
+			return fmt.Errorf("winipcfg SetIPAddresses (luid=%d): %w", uint64(luid), err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown windows interface type %T", adapter)
+	}
+}
+
+// userspaceWGWin bundles the userspace amneziawg-go dataplane objects (Wintun
+// tun + wireguard device + UAPI named-pipe listener) so they satisfy the
+// netIface contract (Close) and can be torn down together. Used on Windows when
+// AmneziaWG obfuscation is enabled, in place of the wireguard-nt kernel driver.
+type userspaceWGWin struct {
+	tun    awgtun.Device
+	device *awgdevice.Device
+	uapi   net.Listener
+	wg     sync.WaitGroup
+}
+
+// Close satisfies netIface: stops the UAPI listener, shuts down the device and
+// waits for the accept goroutine, then closes the Wintun adapter.
+func (u *userspaceWGWin) Close() error {
+	if activeUserspaceWin == u {
+		activeUserspaceWin = nil
+	}
+	if u.uapi != nil {
+		u.uapi.Close()
+	}
+	if u.device != nil {
+		u.device.Close() // also closes the underlying tun
+	}
+	u.wg.Wait()
+	return nil
+}
+
+// luid returns the Wintun adapter LUID for IP/route configuration via winipcfg.
+func (u *userspaceWGWin) luid() winipcfg.LUID {
+	if nt, ok := u.tun.(*awgtun.NativeTun); ok {
+		return winipcfg.LUID(nt.LUID())
+	}
+	return 0
+}
+
+// userspacePeers reads peer handshake times directly from the userspace
+// amneziawg-go device via its UAPI (device.IpcGet), used on Windows where wgctrl
+// cannot read the device. Returns (nil, false) when no userspace device is active
+// so callers fall back to wgctrl.
+func userspacePeers(string) (map[string]wgtypes.Peer, bool) {
+	if activeUserspaceWin == nil || activeUserspaceWin.device == nil {
+		return nil, false
+	}
+	uapi, err := activeUserspaceWin.device.IpcGet()
+	if err != nil {
+		return nil, false
+	}
+	peers := make(map[string]wgtypes.Peer)
+	var cur *wgtypes.Peer
+	var curKey string
+	flush := func() {
+		if cur != nil && curKey != "" {
+			peers[curKey] = *cur
+		}
+	}
+	for _, line := range strings.Split(uapi, "\n") {
+		kv := strings.SplitN(line, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		switch kv[0] {
+		case "public_key":
+			flush()
+			cur, curKey = nil, ""
+			b, derr := hex.DecodeString(kv[1])
+			if derr != nil || len(b) != 32 {
+				continue
+			}
+			var key wgtypes.Key
+			copy(key[:], b)
+			p := wgtypes.Peer{PublicKey: key}
+			cur, curKey = &p, key.String()
+		case "last_handshake_time_sec":
+			if cur != nil {
+				if sec, perr := strconv.ParseInt(kv[1], 10, 64); perr == nil && sec > 0 {
+					cur.LastHandshakeTime = time.Unix(sec, 0)
+				}
+			}
+		}
+	}
+	flush()
+	return peers, true
+}
+
+// createUserSpaceWGWindows brings up the netmaker interface on Windows using the
+// userspace amneziawg-go dataplane over Wintun and applies the server-delivered
+// AmneziaWG obfuscation profile. Requires wintun.dll alongside the executable.
+func (nc *NCIface) createUserSpaceWGWindows() error {
+	tunDev, err := awgtun.CreateTUN(nc.Name, config.Netclient().MTU)
+	if err != nil {
+		return fmt.Errorf("failed to create wintun tun: %w", err)
+	}
+	dev := awgdevice.NewDevice(tunDev, awgconn.NewDefaultBind(), awgdevice.NewLogger(awgdevice.LogLevelSilent, "[netclient] "))
+	if err := dev.Up(); err != nil {
+		tunDev.Close()
+		return fmt.Errorf("failed to bring up userspace device: %w", err)
+	}
+	if awgConf := buildAWGUAPIConfig(); awgConf != "" {
+		if err := dev.IpcSet(awgConf); err != nil {
+			dev.Close()
+			return fmt.Errorf("failed to apply AmneziaWG obfuscation profile: %w", err)
+		}
+		slog.Info("applied AmneziaWG obfuscation profile from server config (windows userspace)")
+	}
+	uapi, err := awgipc.UAPIListen(nc.Name)
+	if err != nil {
+		dev.Close()
+		return fmt.Errorf("failed to listen on UAPI named pipe: %w", err)
+	}
+	u := &userspaceWGWin{tun: tunDev, device: dev, uapi: uapi}
+	u.wg.Add(1)
+	go func() {
+		defer u.wg.Done()
+		for {
+			conn, acceptErr := uapi.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go dev.IpcHandle(conn)
+		}
+	}()
+	nc.Iface = u
+	activeUserspaceWin = u
+	slog.Info("created Windows userspace (amneziawg-go) tunnel")
+	return nil
+}
+
+// activeUserspaceWin points at the live userspace dataplane (if any) so apply()
+// can configure it directly via UAPI, bypassing wgctrl. Set in
+// createUserSpaceWGWindows, cleared in userspaceWGWin.Close.
+var activeUserspaceWin *userspaceWGWin
+
+// applyUserspace configures the userspace amneziawg-go device on Windows directly
+// via its UAPI (device.IpcSet), bypassing wgctrl. This is required because
+// wgctrl's multi-client dispatch tries the in-kernel client first; on our Wintun
+// adapter it returns "Access is denied" (not os.ErrNotExist), so the loop never
+// reaches the userspace named-pipe client. Returns handled=false when no userspace
+// device is active (the wireguard-nt kernel-driver path), so apply() uses wgctrl.
+func applyUserspace(c *wgtypes.Config) (bool, error) {
+	if activeUserspaceWin == nil || activeUserspaceWin.device == nil {
+		return false, nil
+	}
+	if err := activeUserspaceWin.device.IpcSet(wgtypesToUAPI(c)); err != nil {
+		return true, fmt.Errorf("device.IpcSet: %w", err)
+	}
+	return true, nil
+}
+
+// wgtypesToUAPI serializes a wgtypes.Config into the WireGuard UAPI "set" text
+// protocol (hex-encoded keys), suitable for device.IpcSet. Mirrors what wgctrl
+// would send over the socket/pipe.
+func wgtypesToUAPI(c *wgtypes.Config) string {
+	var b strings.Builder
+	if c.PrivateKey != nil {
+		fmt.Fprintf(&b, "private_key=%s\n", hex.EncodeToString(c.PrivateKey[:]))
+	}
+	if c.ListenPort != nil {
+		fmt.Fprintf(&b, "listen_port=%d\n", *c.ListenPort)
+	}
+	if c.FirewallMark != nil {
+		fmt.Fprintf(&b, "fwmark=%d\n", *c.FirewallMark)
+	}
+	if c.ReplacePeers {
+		b.WriteString("replace_peers=true\n")
+	}
+	for i := range c.Peers {
+		p := &c.Peers[i]
+		fmt.Fprintf(&b, "public_key=%s\n", hex.EncodeToString(p.PublicKey[:]))
+		if p.Remove {
+			b.WriteString("remove=true\n")
+			continue
+		}
+		if p.UpdateOnly {
+			b.WriteString("update_only=true\n")
+		}
+		if p.PresharedKey != nil {
+			fmt.Fprintf(&b, "preshared_key=%s\n", hex.EncodeToString(p.PresharedKey[:]))
+		}
+		if p.Endpoint != nil {
+			fmt.Fprintf(&b, "endpoint=%s\n", p.Endpoint.String())
+		}
+		if p.PersistentKeepaliveInterval != nil {
+			fmt.Fprintf(&b, "persistent_keepalive_interval=%d\n", int(p.PersistentKeepaliveInterval.Seconds()))
+		}
+		if p.ReplaceAllowedIPs {
+			b.WriteString("replace_allowed_ips=true\n")
+		}
+		for j := range p.AllowedIPs {
+			fmt.Fprintf(&b, "allowed_ip=%s\n", p.AllowedIPs[j].String())
+		}
+	}
+	return b.String()
 }
 
 // RemoveRoutes - remove routes to the interface

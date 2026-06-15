@@ -9,13 +9,22 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/amnezia-vpn/amneziawg-go/conn"
+	"github.com/amnezia-vpn/amneziawg-go/device"
+	"github.com/amnezia-vpn/amneziawg-go/ipc"
+	"github.com/amnezia-vpn/amneziawg-go/tun"
 	"github.com/gravitl/netclient/config"
 	"golang.org/x/exp/slog"
-	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/device"
-	"golang.zx2c4.com/wireguard/ipc"
-	"golang.zx2c4.com/wireguard/tun"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
+
+// applyUserspace is a no-op on unix: the userspace amneziawg-go device is
+// configured via wgctrl over the unix socket (/var/run/wireguard), which works.
+// Returning handled=false keeps the wgctrl code path in apply().
+func applyUserspace(*wgtypes.Config) (bool, error) { return false, nil }
+
+// userspacePeers is a no-op on unix; wgctrl reads the device fine.
+func userspacePeers(string) (map[string]wgtypes.Peer, bool) { return nil, false }
 
 // == private ==
 
@@ -37,6 +46,16 @@ func (nc *NCIface) createUserSpaceWG() error {
 	if err != nil {
 		return err
 	}
+	// Apply the AmneziaWG DPI-obfuscation profile delivered from the netmaker
+	// server (global setting). When disabled/unset the device stays vanilla WG.
+	// The parameters must be identical on all peers or the tunnel won't establish.
+	if awgConf := buildAWGUAPIConfig(); awgConf != "" {
+		if err = tunDevice.IpcSet(awgConf); err != nil {
+			slog.Error("failed to apply AmneziaWG obfuscation profile", "error", err)
+			return err
+		}
+		slog.Info("applied AmneziaWG obfuscation profile from server config")
+	}
 	uapi, err = getUAPIByInterface(nc.Name)
 	if err != nil {
 		return err
@@ -50,6 +69,9 @@ func (nc *NCIface) createUserSpaceWG() error {
 				slog.Debug("tunDevice.Wait() returned")
 				return
 			default:
+				if uapi == nil {
+					return
+				}
 				uapiConn, uapiErr := uapi.Accept()
 				if uapiErr != nil {
 					slog.Debug("uapi error:", "error", uapiErr)

@@ -5,6 +5,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gravitl/netclient/config"
 	"github.com/gravitl/netmaker/logger"
@@ -90,27 +91,80 @@ func HolePunch(portToStun, proto int) (publicIP net.IP, publicPort int, natType 
 		return
 	}
 
-	for _, stunServer := range StunServers {
-		var err4 error
-		var err6 error
-		if proto == 4 {
-			publicIP, publicPort, natType, err4 = callHolePunch(stunServer, portToStun, "udp4")
-			if err4 != nil {
-				slog.Warn("callHolePunch udp4 error", err4.Error())
-			}
-		} else {
-			publicIP, publicPort, natType, err6 = callHolePunch(stunServer, portToStun, "udp6")
-			if err6 != nil {
-				slog.Warn("callHolePunch udp6 error", err6.Error())
-			}
-		}
-		if err4 != nil || err6 != nil {
+	network := "udp4"
+	if proto != 4 {
+		network = "udp6"
+	}
+	firstIdx := -1
+	for i, stunServer := range StunServers {
+		pubIP, pubPort, nType, err := callHolePunch(stunServer, portToStun, network)
+		if err != nil {
+			slog.Warn("callHolePunch error", "network", network, "error", err.Error())
 			continue
 		}
+		publicIP, publicPort, natType = pubIP, pubPort, nType
+		firstIdx = i
 		break
 	}
+
+	// NAT type here is only public vs behind_nat. Whether a behind-NAT host actually
+	// needs a relay is decided by the liveness-based connectivity manager (which
+	// observes real WireGuard handshakes), not by STUN heuristics — STUN cannot
+	// reliably predict hole-punch success (e.g. CGNAT passes the symmetric test yet
+	// can't be punched). detectSymmetric is kept for diagnostics only.
+	_ = firstIdx
 	slog.Debug("hole punching complete", "public ip", publicIP.String(), "public port", strconv.Itoa(publicPort), "nat type", natType)
 	return
+}
+
+// detectSymmetric reports whether the NAT maps a single local socket to different
+// external ports for two different STUN destinations (symmetric NAT).
+func detectSymmetric(network string, servers []StunServer) bool {
+	if len(servers) < 2 {
+		return false
+	}
+	conn, err := net.ListenUDP(network, &net.UDPAddr{})
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	s0, err0 := net.ResolveUDPAddr(network, net.JoinHostPort(servers[0].Domain, fmt.Sprintf("%d", servers[0].Port)))
+	s1, err1 := net.ResolveUDPAddr(network, net.JoinHostPort(servers[1].Domain, fmt.Sprintf("%d", servers[1].Port)))
+	if err0 != nil || err1 != nil {
+		return false
+	}
+	p0, ok0 := stunMappedPort(conn, s0)
+	p1, ok1 := stunMappedPort(conn, s1)
+	return ok0 && ok1 && p0 != p1
+}
+
+// stunMappedPort sends a STUN binding request to server from conn (an unconnected
+// UDP socket) and returns the external port the NAT assigned for this socket.
+func stunMappedPort(conn *net.UDPConn, server *net.UDPAddr) (int, bool) {
+	req := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
+	if _, err := conn.WriteToUDP(req.Raw, server); err != nil {
+		return 0, false
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1500)
+	for {
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			return 0, false
+		}
+		resp := &stun.Message{Raw: append([]byte(nil), buf[:n]...)}
+		if resp.Decode() != nil {
+			continue
+		}
+		if resp.TransactionID != req.TransactionID {
+			continue
+		}
+		var xorAddr stun.XORMappedAddress
+		if xorAddr.GetFrom(resp) != nil {
+			return 0, false
+		}
+		return xorAddr.Port, true
+	}
 }
 
 func callHolePunch(stunServer StunServer, portToStun int, network string) (publicIP net.IP, publicPort int, natType string, err error) {
