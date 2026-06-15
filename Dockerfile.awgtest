@@ -1,4 +1,4 @@
-FROM alpine:3.23.3
+FROM alpine:3.24.0
 WORKDIR /root/
 RUN apk add --no-cache --update bash iproute2 iptables wireguard-tools
 COPY netclient-app /root/netclient
