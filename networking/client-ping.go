@@ -144,9 +144,14 @@ func CheckPeerEndpoints(ctx context.Context, waitg *sync.WaitGroup) {
 						if !ok {
 							continue
 						}
-						// check if local endpoint is present
+						// check if local endpoint is present. devicePeer.Endpoint is
+						// nil for a peer with no endpoint on the device (e.g. a relayed
+						// or probe peer) — guard against it (and a nil localEndpoint) so
+						// endpoint detection never dereferences a nil *net.UDPAddr.
 						localEndpoint, ok := wireguard.GetBetterEndpoint(pubKey)
-						if ok && !devicePeer.Endpoint.IP.Equal(localEndpoint.IP) {
+						if ok && localEndpoint != nil &&
+							(devicePeer.Endpoint == nil || devicePeer.Endpoint.IP == nil ||
+								!devicePeer.Endpoint.IP.Equal(localEndpoint.IP)) {
 							SetPeerEndpoint(pubKey, cache.EndpointCacheValue{Endpoint: localEndpoint})
 						}
 					}

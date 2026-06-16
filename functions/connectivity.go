@@ -162,6 +162,14 @@ func collectObservedEndpoints(now time.Time) map[string]string {
 		if dp.Endpoint == nil || dp.Endpoint.IP == nil || dp.Endpoint.Port == 0 {
 			continue
 		}
+		// Only report PUBLIC reflexive addresses. A private/loopback/link-local
+		// endpoint is never a valid cross-NAT hole-punch target; reporting one would
+		// poison the server's observed-endpoint cache (e.g. a local path a peer
+		// learned over another overlay), so skip it.
+		ip := dp.Endpoint.IP
+		if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+			continue
+		}
 		if dp.LastHandshakeTime.IsZero() || now.Sub(dp.LastHandshakeTime) >= handshakeFreshness {
 			continue
 		}
