@@ -13,10 +13,24 @@ import (
 )
 
 const (
-	connCheckInterval  = 20 * time.Second
-	directGracePeriod  = 75 * time.Second // time to let a direct path establish after (re)trying
-	handshakeFreshness = 150 * time.Second
+	connCheckInterval  = 10 * time.Second
+	directGracePeriod  = 75 * time.Second  // time to let a direct path establish after (re)trying
+	handshakeFreshness = 150 * time.Second // a WG handshake older than this is treated as no direct path
+	// rxStallTimeout drives ACTIVE liveness: with the default 20s persistent
+	// keepalive we keep sending to a direct peer, so a working path keeps the
+	// inbound byte counter moving. If we are still transmitting but have received
+	// nothing for this long, the direct path is dead — detected in ~35s instead of
+	// waiting up to handshakeFreshness (~150s) for the handshake to go stale. This
+	// is what makes the direct->relay fallback fast.
+	rxStallTimeout = 35 * time.Second
 )
+
+// peerTraffic tracks per-peer byte counters to detect a stalled (dead) direct path.
+type peerTraffic struct {
+	rx, tx        int64
+	lastRxAdvance time.Time
+	lastTxAdvance time.Time
+}
 
 // StartConnectivityManager runs the liveness-based adaptive relay decision.
 //
@@ -36,12 +50,14 @@ func StartConnectivityManager(ctx context.Context, wg *sync.WaitGroup) {
 	relayed := false
 	directDeadline := time.Now().Add(directGracePeriod)
 	lastEndpoint := ""
+	traffic := map[string]*peerTraffic{}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			now := time.Now()
 			nc := config.Netclient()
 			server := config.GetServer(config.CurrServer)
 			if nc == nil || server == nil || !server.Stun || nc.IsStatic {
@@ -76,7 +92,7 @@ func StartConnectivityManager(ctx context.Context, wg *sync.WaitGroup) {
 			// already-established session with no handshake gap.
 			verdict := nmmodels.NAT_Types.BehindNAT
 			switch {
-			case hasDirectConnectivity(server.AutoRelayPubKey):
+			case hasDirectConnectivity(server.AutoRelayPubKey, traffic, now):
 				if relayed {
 					slog.Info("connectivity: direct path proven live in background, un-relaying")
 				}
@@ -104,15 +120,24 @@ func StartConnectivityManager(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
-// hasDirectConnectivity reports whether the host has a fresh WireGuard handshake
-// with at least one of its expected peers, excluding the auto-relay node (which
-// is public and always reachable, so a handshake with it must not mask isolation
-// from the actual peers). It returns true ONLY on positive proof (a fresh
-// handshake). All "no information" cases (no peers, unreadable device state)
-// return false: without proof we must not claim a direct path, otherwise a
-// transient empty/unreadable state would un-relay a correctly-relayed node and
-// cause relay<->direct flapping.
-func hasDirectConnectivity(relayPubKey string) bool {
+// hasDirectConnectivity reports whether the host has a LIVE direct path to at
+// least one of its expected peers, excluding the auto-relay node (which is
+// public and always reachable, so a handshake with it must not mask isolation
+// from the actual peers).
+//
+// A peer's direct path is live when it has a fresh WireGuard handshake AND its
+// inbound byte counter is moving. The byte-counter (active liveness) check is
+// what makes the direct->relay fallback fast: with the default 20s keepalive we
+// keep transmitting, so if we are still sending but have received nothing for
+// rxStallTimeout (~35s) the path is dead — detected long before the handshake
+// goes stale (~150s). The traffic map carries per-peer counter state across
+// ticks and is pruned to the current peer set.
+//
+// Returns true ONLY on positive proof. All "no information" cases (no peers,
+// unreadable device state) return false: without proof we must not claim a
+// direct path, otherwise a transient empty/unreadable state would un-relay a
+// correctly-relayed node and cause relay<->direct flapping.
+func hasDirectConnectivity(relayPubKey string, traffic map[string]*peerTraffic, now time.Time) bool {
 	nc := config.Netclient()
 	peers := nc.HostPeers
 	if len(peers) == 0 {
@@ -122,7 +147,8 @@ func hasDirectConnectivity(relayPubKey string) bool {
 	if err != nil {
 		return false
 	}
-	nonRelayPeers := 0
+	seen := map[string]bool{}
+	live := false
 	for i := range peers {
 		p := &peers[i]
 		if p.Remove {
@@ -132,20 +158,44 @@ func hasDirectConnectivity(relayPubKey string) bool {
 		if relayPubKey != "" && pk == relayPubKey {
 			continue
 		}
-		nonRelayPeers++
 		dp, ok := devicePeers[pk]
 		if !ok {
 			continue
 		}
-		if !dp.LastHandshakeTime.IsZero() && time.Since(dp.LastHandshakeTime) < handshakeFreshness {
-			return true
+		seen[pk] = true
+
+		st := traffic[pk]
+		if st == nil {
+			st = &peerTraffic{rx: dp.ReceiveBytes, tx: dp.TransmitBytes, lastRxAdvance: now, lastTxAdvance: now}
+			traffic[pk] = st
+		} else {
+			if dp.ReceiveBytes > st.rx {
+				st.lastRxAdvance = now
+			}
+			if dp.TransmitBytes > st.tx {
+				st.lastTxAdvance = now
+			}
+			st.rx = dp.ReceiveBytes
+			st.tx = dp.TransmitBytes
+		}
+
+		if dp.LastHandshakeTime.IsZero() || now.Sub(dp.LastHandshakeTime) >= handshakeFreshness {
+			continue // no (fresh) handshake — not a live direct path
+		}
+		// Active liveness: only conclude "dead" when we are still transmitting
+		// (keepalive/traffic) yet receiving nothing. If we are not transmitting
+		// either, the stall is uninformative and we fall back to the handshake.
+		txActive := now.Sub(st.lastTxAdvance) < rxStallTimeout
+		rxStalled := now.Sub(st.lastRxAdvance) >= rxStallTimeout
+		if txActive && rxStalled {
+			continue // direct path to this peer is dead
+		}
+		live = true
+	}
+	for pk := range traffic {
+		if !seen[pk] {
+			delete(traffic, pk)
 		}
 	}
-	// No fresh handshake with any non-relay peer. Direct connectivity is NOT
-	// proven — return false even when there are currently no non-relay peers
-	// (e.g. a transient peer-update where the relayed peer is briefly absent).
-	// Treating "no peers to check" as "direct works" caused relay<->direct
-	// flapping: a momentary empty set un-relayed a correctly-relayed node.
-	_ = nonRelayPeers
-	return false
+	return live
 }

@@ -213,6 +213,18 @@ func userspacePeers(string) (map[string]wgtypes.Peer, bool) {
 					cur.LastHandshakeTime = time.Unix(sec, 0)
 				}
 			}
+		case "rx_bytes":
+			if cur != nil {
+				if v, perr := strconv.ParseInt(kv[1], 10, 64); perr == nil {
+					cur.ReceiveBytes = v
+				}
+			}
+		case "tx_bytes":
+			if cur != nil {
+				if v, perr := strconv.ParseInt(kv[1], 10, 64); perr == nil {
+					cur.TransmitBytes = v
+				}
+			}
 		}
 	}
 	flush()
