@@ -51,6 +51,7 @@ func StartConnectivityManager(ctx context.Context, wg *sync.WaitGroup) {
 	directDeadline := time.Now().Add(directGracePeriod)
 	lastEndpoint := ""
 	traffic := map[string]*peerTraffic{}
+	lastObserved := map[string]string{}
 
 	for {
 		select {
@@ -62,6 +63,18 @@ func StartConnectivityManager(ctx context.Context, wg *sync.WaitGroup) {
 			server := config.GetServer(config.CurrServer)
 			if nc == nil || server == nil || !server.Stun || nc.IsStatic {
 				continue
+			}
+
+			// Report the real external WG endpoints we observe for our peers (the
+			// data-path reflexive addresses). A relay sees every peer's true source
+			// address; the server hands these to other peers as hole-punch
+			// candidates. Publish only when the set changes to avoid MQ chatter.
+			if obs := collectObservedEndpoints(now); !sameStringMap(obs, lastObserved) {
+				if err := PublishObservedEndpoints(obs); err != nil {
+					slog.Warn("connectivity: failed to publish observed endpoints", "error", err.Error())
+				} else {
+					lastObserved = obs
+				}
 			}
 			// Public hosts never need a relay.
 			if config.HostNatType == nmmodels.NAT_Types.Public {
@@ -123,6 +136,42 @@ func StartConnectivityManager(ctx context.Context, wg *sync.WaitGroup) {
 			}
 		}
 	}
+}
+
+// collectObservedEndpoints reads the WG device and returns the real external
+// endpoint (peer-pubkey -> "ip:port") for every peer we currently have a live
+// session with (an endpoint plus a fresh handshake). For a relay this is every
+// relayed peer's true source address — the correct hole-punch target to advertise
+// to other peers, even when the peer's own STUN self-report is wrong or stale.
+func collectObservedEndpoints(now time.Time) map[string]string {
+	out := map[string]string{}
+	devicePeers, err := wireguard.GetPeersFromDevice(ncutils.GetInterfaceName())
+	if err != nil {
+		return out
+	}
+	for pk, dp := range devicePeers {
+		if dp.Endpoint == nil || dp.Endpoint.IP == nil || dp.Endpoint.Port == 0 {
+			continue
+		}
+		if dp.LastHandshakeTime.IsZero() || now.Sub(dp.LastHandshakeTime) >= handshakeFreshness {
+			continue
+		}
+		out[pk] = dp.Endpoint.String()
+	}
+	return out
+}
+
+// sameStringMap reports whether two string maps are identical.
+func sameStringMap(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // directReachability returns how many of the host's non-relay peers currently

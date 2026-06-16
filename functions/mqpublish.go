@@ -193,6 +193,29 @@ func publishPeerSignal(signal models.Signal) error {
 	return nil
 }
 
+// PublishObservedEndpoints reports the real external WireGuard endpoints this
+// host observes for its peers (peer-pubkey -> "ip:port"). The server caches these
+// and uses them as hole-punch candidates for OTHER peers. The Host is sent
+// unchanged so the server's update path is a harmless no-op; only the observed
+// endpoints (stored at the top of the handler) matter.
+func PublishObservedEndpoints(eps map[string]string) error {
+	if len(eps) == 0 {
+		return nil
+	}
+	server := config.CurrServer
+	hostCfg := config.Netclient()
+	hostUpdate := models.HostUpdate{
+		Action:            models.UpdateHost,
+		Host:              hostCfg.Host,
+		ObservedEndpoints: eps,
+	}
+	data, err := json.Marshal(hostUpdate)
+	if err != nil {
+		return err
+	}
+	return publish(server, fmt.Sprintf("host/serverupdate/%s/%s", server, hostCfg.ID.String()), data, 1)
+}
+
 // PublishHostUpdate - publishes host updates to server
 func PublishHostUpdate(server string, hostAction models.HostMqAction) error {
 	hostCfg := config.Netclient()
