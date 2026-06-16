@@ -80,21 +80,26 @@ func StartConnectivityManager(ctx context.Context, wg *sync.WaitGroup) {
 			}
 			if ep != lastEndpoint {
 				lastEndpoint = ep
-				slog.Info("connectivity: public endpoint changed, re-evaluating direct", "endpoint", ep)
+				slog.Info("connectivity: public endpoint changed, re-evaluating", "endpoint", ep)
 				directDeadline = time.Now().Add(directGracePeriod)
 			}
 
-			// Continuous evaluation. A fresh handshake with any non-relay peer means
-			// a direct path exists right now — including the background probe session
-			// maintained while relayed. Because both the relay session and the direct
-			// probe are kept warm, flipping the verdict (which the server's auto-relay
-			// reconciler turns into an un-relay / re-relay) moves the routing onto an
-			// already-established session with no handshake gap.
+			// A host must be relayed unless it can reach EVERY peer over a direct
+			// (hole-punched) path. If even one peer is reachable only via the relay,
+			// that peer can't reach us back directly either, so we stay relayed so it
+			// can reach us through the relay. We un-relay only once ALL peers are
+			// directly reachable — this both fixes "others can't reach a symmetric
+			// host" and avoids relay<->direct flapping when some peers punch and some
+			// don't. The background probe sessions are kept warm, so the switch has
+			// no handshake gap.
+			reachable, total := directReachability(server.AutoRelayPubKey, traffic, now)
 			verdict := nmmodels.NAT_Types.BehindNAT
 			switch {
-			case hasDirectConnectivity(server.AutoRelayPubKey, traffic, now):
+			case total == 0:
+				verdict = nmmodels.NAT_Types.BehindNAT // no peers yet — nothing to decide
+			case reachable == total:
 				if relayed {
-					slog.Info("connectivity: direct path proven live in background, un-relaying")
+					slog.Info("connectivity: all peers reachable directly, un-relaying")
 				}
 				relayed = false
 				verdict = nmmodels.NAT_Types.BehindNAT
@@ -104,7 +109,7 @@ func StartConnectivityManager(ctx context.Context, wg *sync.WaitGroup) {
 			case time.Now().After(directDeadline):
 				relayed = true
 				verdict = nmmodels.NAT_Types.Symmetric
-				slog.Info("connectivity: no direct path to peers within grace, requesting relay")
+				slog.Info("connectivity: some peers not directly reachable, requesting relay", "reachable", reachable, "total", total)
 			default:
 				verdict = nmmodels.NAT_Types.BehindNAT
 			}
@@ -120,35 +125,32 @@ func StartConnectivityManager(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
-// hasDirectConnectivity reports whether the host has a LIVE direct path to at
-// least one of its expected peers, excluding the auto-relay node (which is
-// public and always reachable, so a handshake with it must not mask isolation
-// from the actual peers).
+// directReachability returns how many of the host's non-relay peers currently
+// have a LIVE direct (hole-punched) path, and the total number of such peers it
+// could evaluate. The auto-relay node is excluded (it is public and always
+// reachable, so it must not mask isolation from the actual peers).
 //
 // A peer's direct path is live when it has a fresh WireGuard handshake AND its
-// inbound byte counter is moving. The byte-counter (active liveness) check is
-// what makes the direct->relay fallback fast: with the default 20s keepalive we
-// keep transmitting, so if we are still sending but have received nothing for
+// inbound byte counter is moving. The byte-counter (active liveness) check makes
+// the direct->relay fallback fast: with the default 20s keepalive we keep
+// transmitting, so if we are still sending but have received nothing for
 // rxStallTimeout (~35s) the path is dead — detected long before the handshake
 // goes stale (~150s). The traffic map carries per-peer counter state across
 // ticks and is pruned to the current peer set.
 //
-// Returns true ONLY on positive proof. All "no information" cases (no peers,
-// unreadable device state) return false: without proof we must not claim a
-// direct path, otherwise a transient empty/unreadable state would un-relay a
-// correctly-relayed node and cause relay<->direct flapping.
-func hasDirectConnectivity(relayPubKey string, traffic map[string]*peerTraffic, now time.Time) bool {
+// "No information" cases (no peers, unreadable device state) return (0,0) so the
+// caller treats them as "nothing decided", never as "all reachable".
+func directReachability(relayPubKey string, traffic map[string]*peerTraffic, now time.Time) (reachable, total int) {
 	nc := config.Netclient()
 	peers := nc.HostPeers
 	if len(peers) == 0 {
-		return false
+		return 0, 0
 	}
 	devicePeers, err := wireguard.GetPeersFromDevice(ncutils.GetInterfaceName())
 	if err != nil {
-		return false
+		return 0, 0
 	}
 	seen := map[string]bool{}
-	live := false
 	for i := range peers {
 		p := &peers[i]
 		if p.Remove {
@@ -163,6 +165,7 @@ func hasDirectConnectivity(relayPubKey string, traffic map[string]*peerTraffic, 
 			continue
 		}
 		seen[pk] = true
+		total++
 
 		st := traffic[pk]
 		if st == nil {
@@ -190,12 +193,12 @@ func hasDirectConnectivity(relayPubKey string, traffic map[string]*peerTraffic, 
 		if txActive && rxStalled {
 			continue // direct path to this peer is dead
 		}
-		live = true
+		reachable++
 	}
 	for pk := range traffic {
 		if !seen[pk] {
 			delete(traffic, pk)
 		}
 	}
-	return live
+	return reachable, total
 }
