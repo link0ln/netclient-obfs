@@ -179,7 +179,8 @@ func startGoRoutines(wg *sync.WaitGroup) context.CancelFunc {
 	if server.Stun && server.StunServers != "" {
 		stun.LoadStunServers(server.StunServers)
 	} else {
-		stun.SetDefaultStunServers()
+		// No advertised list yet: use the self-hosted server, never a third party.
+		stun.UseSelfStunServer(stunSelfHost(), 0)
 	}
 	netclientCfg := config.Netclient()
 
@@ -640,6 +641,20 @@ func UpdateKeys() error {
 	return nil
 }
 
+// stunSelfHost returns the self-hosted server's host (without port), used for
+// STUN so the client never depends on a third-party service. Derived from the
+// current server name/address.
+func stunSelfHost() string {
+	s := config.CurrServer
+	if s == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		return host
+	}
+	return s
+}
+
 func holePunchWgPort(proto, portToStun int) (pubIP net.IP, pubPort int, natType string) {
 	defer func() {
 		//ncutils.TraceCaller()
@@ -649,7 +664,7 @@ func holePunchWgPort(proto, portToStun int) (pubIP net.IP, pubPort int, natType 
 	if server == nil {
 		server = &config.Server{}
 		server.Stun = true
-		stun.SetDefaultStunServers()
+		stun.UseSelfStunServer(stunSelfHost(), 0)
 	}
 	_, ipErr := GetPublicIP(uint(proto))
 	if ipErr != nil {

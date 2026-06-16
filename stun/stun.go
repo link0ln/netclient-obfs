@@ -14,13 +14,12 @@ import (
 	"gortc.io/stun"
 )
 
+// StunServers holds the STUN servers to use. Self-hosted ONLY — there is NO
+// third-party default (no Google). It is populated from the server's advertised
+// StunServers, or pointed at the self-hosted server as a fallback; if neither is
+// known, it stays empty and STUN is simply skipped (never an external call).
 var (
-	StunServers = []StunServer{
-		{Domain: "stun1.l.google.com", Port: 19302},
-		{Domain: "stun2.l.google.com", Port: 19302},
-		{Domain: "stun3.l.google.com", Port: 19302},
-		{Domain: "stun4.l.google.com", Port: 19302},
-	}
+	StunServers = []StunServer{}
 )
 
 // StunServer - struct to hold data required for using stun server
@@ -48,13 +47,24 @@ func LoadStunServers(list string) {
 
 }
 
+// SetDefaultStunServers clears the STUN list. With no self-hosted server known,
+// STUN is disabled rather than falling back to any third-party service.
 func SetDefaultStunServers() {
-	StunServers = []StunServer{
-		{Domain: "stun1.l.google.com", Port: 19302},
-		{Domain: "stun2.l.google.com", Port: 19302},
-		{Domain: "stun3.l.google.com", Port: 19302},
-		{Domain: "stun4.l.google.com", Port: 19302},
+	StunServers = []StunServer{}
+}
+
+// UseSelfStunServer points STUN at the self-hosted server (host:port). Used as the
+// fallback when the server has not yet pushed its StunServers list, so the client
+// never depends on a third-party STUN service.
+func UseSelfStunServer(host string, port int) {
+	if host == "" {
+		StunServers = []StunServer{}
+		return
 	}
+	if port <= 0 {
+		port = 3478
+	}
+	StunServers = []StunServer{{Domain: host, Port: port}}
 }
 
 // DoesIPExistLocally - checks if the IP address exists on a local interface

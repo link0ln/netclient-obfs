@@ -23,6 +23,9 @@ const (
 	// waiting up to handshakeFreshness (~150s) for the handshake to go stale. This
 	// is what makes the direct->relay fallback fast.
 	rxStallTimeout = 35 * time.Second
+	// observedRefresh re-publishes observed peer endpoints even when unchanged, to
+	// keep the server's cache (3m TTL) warm on a stable mesh with fixed endpoints.
+	observedRefresh = 60 * time.Second
 )
 
 // peerTraffic tracks per-peer byte counters to detect a stalled (dead) direct path.
@@ -52,6 +55,7 @@ func StartConnectivityManager(ctx context.Context, wg *sync.WaitGroup) {
 	lastEndpoint := ""
 	traffic := map[string]*peerTraffic{}
 	lastObserved := map[string]string{}
+	lastObservedPublish := time.Time{}
 
 	for {
 		select {
@@ -68,12 +72,17 @@ func StartConnectivityManager(ctx context.Context, wg *sync.WaitGroup) {
 			// Report the real external WG endpoints we observe for our peers (the
 			// data-path reflexive addresses). A relay sees every peer's true source
 			// address; the server hands these to other peers as hole-punch
-			// candidates. Publish only when the set changes to avoid MQ chatter.
-			if obs := collectObservedEndpoints(now); !sameStringMap(obs, lastObserved) {
+			// candidates. Publish when the set changes, AND refresh periodically even
+			// when unchanged: the server caches observations with a TTL, so a stable
+			// mesh (fixed endpoints) must keep refreshing or the cache expires and the
+			// hole-punch candidate is lost.
+			if obs := collectObservedEndpoints(now); len(obs) > 0 &&
+				(!sameStringMap(obs, lastObserved) || now.Sub(lastObservedPublish) > observedRefresh) {
 				if err := PublishObservedEndpoints(obs); err != nil {
 					slog.Warn("connectivity: failed to publish observed endpoints", "error", err.Error())
 				} else {
 					lastObserved = obs
+					lastObservedPublish = now
 				}
 			}
 			// Public hosts never need a relay.
