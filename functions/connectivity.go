@@ -65,7 +65,7 @@ func StartConnectivityManager(ctx context.Context, wg *sync.WaitGroup) {
 			now := time.Now()
 			nc := config.Netclient()
 			server := config.GetServer(config.CurrServer)
-			if nc == nil || server == nil || !server.Stun || nc.IsStatic {
+			if nc == nil || server == nil || !server.Stun {
 				continue
 			}
 
@@ -75,7 +75,9 @@ func StartConnectivityManager(ctx context.Context, wg *sync.WaitGroup) {
 			// candidates. Publish when the set changes, AND refresh periodically even
 			// when unchanged: the server caches observations with a TTL, so a stable
 			// mesh (fixed endpoints) must keep refreshing or the cache expires and the
-			// hole-punch candidate is lost.
+			// hole-punch candidate is lost. This runs even on a STATIC node — the relay
+			// is static yet is the single most important observer (it is in every
+			// relayed peer's data path).
 			if obs := collectObservedEndpoints(now); len(obs) > 0 &&
 				(!sameStringMap(obs, lastObserved) || now.Sub(lastObservedPublish) > observedRefresh) {
 				if err := PublishObservedEndpoints(obs); err != nil {
@@ -84,6 +86,12 @@ func StartConnectivityManager(ctx context.Context, wg *sync.WaitGroup) {
 					lastObserved = obs
 					lastObservedPublish = now
 				}
+			}
+
+			// The relay decision below is for NAT'd nodes only. A static node (e.g. the
+			// relay itself) never needs a relay, but still reports observations above.
+			if nc.IsStatic {
+				continue
 			}
 			// Public hosts never need a relay.
 			if config.HostNatType == nmmodels.NAT_Types.Public {
