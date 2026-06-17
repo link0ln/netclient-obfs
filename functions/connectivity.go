@@ -83,6 +83,7 @@ func StartConnectivityManager(ctx context.Context, wg *sync.WaitGroup) {
 				if err := PublishObservedEndpoints(obs); err != nil {
 					slog.Warn("connectivity: failed to publish observed endpoints", "error", err.Error())
 				} else {
+					slog.Info("connectivity: published observed endpoints", "count", len(obs), "endpoints", obs)
 					lastObserved = obs
 					lastObservedPublish = now
 				}
