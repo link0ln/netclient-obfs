@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/gravitl/netclient/cache"
 	"github.com/gravitl/netclient/config"
+	"github.com/gravitl/netclient/ncutils"
 	"github.com/gravitl/netclient/wireguard"
 	"github.com/gravitl/netmaker/logger"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
@@ -86,6 +88,20 @@ func storeNewPeerIface(peerPubKey string, endpoint *net.UDPAddr) error {
 }
 
 func SetPeerEndpoint(peerPubKey string, value cache.EndpointCacheValue) error {
+
+	// External-preferred priority: an endpoint discovered by endpoint detection is
+	// always an INTERNAL/private candidate (handleEndpointDetection only probes
+	// private IPs). Apply it ONLY as a fallback — never override a peer that already
+	// has a live path (fresh handshake), so the PUBLIC/external hole-punched path
+	// keeps priority. The external endpoint (set by the server) gets ~5s to complete
+	// a handshake well before the slow local probe finishes, so a working external
+	// path is preserved and the internal endpoint is used only when external is dead.
+	if dps, err := wireguard.GetPeersFromDevice(ncutils.GetInterfaceName()); err == nil {
+		if dp, ok := dps[peerPubKey]; ok && !dp.LastHandshakeTime.IsZero() &&
+			time.Since(dp.LastHandshakeTime) < LastHandShakeThreshold {
+			return nil // current (external) path is live — keep it, don't fall back
+		}
+	}
 
 	currentServerPeers := config.Netclient().HostPeers
 	for i := range currentServerPeers {

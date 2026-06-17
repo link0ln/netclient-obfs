@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/gravitl/netclient/cache"
 	"github.com/gravitl/netclient/config"
@@ -17,6 +18,10 @@ import (
 const (
 	IPv4Network = "0.0.0.0/0"
 	IPv6Network = "::/0"
+	// betterEndpointHandshakeThreshold: a peer whose last handshake is fresher than
+	// this is treated as having a live path, so its (external) endpoint is kept and
+	// a cached internal/private candidate is NOT applied over it (external-preferred).
+	betterEndpointHandshakeThreshold = 3 * time.Minute
 )
 
 var ErrPeerNotFound = fmt.Errorf("peer not found")
@@ -57,12 +62,24 @@ func SetPeers(replace bool) error {
 		return errors.New("server config not found")
 	}
 	data := getHAEgressDataForProcessing(server.MetricsPort)
+	// External-preferred: a cached "better" endpoint is always an INTERNAL/private
+	// candidate; only let it override the server-provided external endpoint when the
+	// peer has NO live path (stale/zero handshake). This keeps the public hole-punch
+	// as the priority and uses the internal endpoint purely as a fallback.
+	livePeers := map[string]bool{}
+	if dps, err := GetPeersFromDevice(ncutils.GetInterfaceName()); err == nil {
+		for pk, dp := range dps {
+			if !dp.LastHandshakeTime.IsZero() && time.Since(dp.LastHandshakeTime) < betterEndpointHandshakeThreshold {
+				livePeers[pk] = true
+			}
+		}
+	}
 	for i := range peers {
 		peer := peers[i]
 		if peer.Endpoint != nil && peer.Endpoint.IP == nil {
 			peers[i].Endpoint = nil
 		}
-		if !peer.Remove && checkForBetterEndpoint(&peer) {
+		if !peer.Remove && !livePeers[peer.PublicKey.String()] && checkForBetterEndpoint(&peer) {
 			peers[i] = peer
 		}
 		// set egress routes on correct peer
