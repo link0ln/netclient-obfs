@@ -3,7 +3,7 @@
 # (netclient, netmaker, amneziawg-go), because netclient's go.mod resolves them
 # via local replace directives:
 #   docker build -f netclient/Dockerfile.obfs -t netclient-obfs .
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-alpine AS builder
 RUN apk add --no-cache git
 WORKDIR /src
 COPY amneziawg-go ./amneziawg-go
