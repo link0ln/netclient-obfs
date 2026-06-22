@@ -17,7 +17,7 @@ RUN GOOS=linux CGO_ENABLED=0 go build \
     -ldflags="-w -s -X github.com/amnezia-vpn/amneziawg-go/ipc.socketDirectory=/var/run/wireguard" \
     -o netclient .
 
-FROM alpine:3.23.4
+FROM alpine:3.24.1
 WORKDIR /root/
 # conntrack-tools + tcpdump included for the multi-NAT test rig (cone/symmetric
 # gateway control); harmless in normal use.
